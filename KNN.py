@@ -1,70 +1,126 @@
 import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.decomposition import PCA
-from imblearn.over_sampling import SMOTE
+import numpy as np
 
-# ---- Load the dataset ----
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import accuracy_score
+
+##############################################################################
+# 1. LOAD & PREPARE DATA
+##############################################################################
+
+# Load dataset
 df = pd.read_csv("processed_data.csv")
 
-# Separate features and labels
-X = df.iloc[:, :-2]  # all columns except last two
-y_primary = df["Primary Typing Label"]
-y_secondary = df["Secondary Typing Label"]
+# Replace missing secondary types with -1 (indicates mono-type Pokémon)
+df['Secondary Typing Label'] = df['Secondary Typing Label'].fillna(-1)
 
-# ---- Split into train and test BEFORE applying SMOTE ----
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y_primary, test_size=0.2, random_state=42, stratify=y_primary
+# Extract features and labels
+X = df.drop(['Primary Typing Label', 'Secondary Typing Label'], axis=1)
+y_primary = df['Primary Typing Label'].values
+y_secondary = df['Secondary Typing Label'].values
+
+# Train-test split (stratify by primary label)
+X_train, X_test, y_train, y_test, sec_train, sec_test = train_test_split(
+    X, y_primary, y_secondary,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_primary
 )
 
-# ---- Apply SMOTE to training set only ----
-smote = SMOTE(random_state=42)
-X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+##############################################################################
+# 2. BUILD PIPELINE (Scaler → PCA → KNN)
+##############################################################################
 
-# ---- Apply PCA (e.g., reduce to 20 components or less) ----
-pca = PCA(n_components=20)  # you can try other values (e.g., 10, 30, etc.)
-X_train_pca = pca.fit_transform(X_train_resampled)
-X_test_pca = pca.transform(X_test)
+pipeline = Pipeline([
+    ('scaler', StandardScaler()),
+    ('pca', PCA()),
+    ('classifier', KNeighborsClassifier())
+])
 
-# ---- Train KNN model ----
-k = 5
-knn = KNeighborsClassifier(n_neighbors=k)
-knn.fit(X_train_pca, y_train_resampled)
+# Parameter grid for PCA and KNN
+param_grid = {
+    'pca__n_components': [0.85, 0.9, 0.95],
+    'classifier__n_neighbors': [1, 3, 5, 7],
+    'classifier__weights': ['uniform', 'distance'],
+    'classifier__metric': ['euclidean', 'manhattan', 'minkowski']
+}
 
-# ---- Evaluate on test set ----
-y_pred = knn.predict(X_test_pca)
-print("=== Classification Report (Primary Type) ===")
-print(classification_report(y_test, y_pred))
+# Grid search using primary label accuracy only
+grid_search = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    scoring='accuracy',
+    cv=5,
+    n_jobs=-1,
+    verbose=1
+)
 
-# ---- Re-run prediction on full dataset for 'either type' check ----
-X_full_pca = pca.transform(X)
-y_pred_full = knn.predict(X_full_pca)
+print("Starting grid search...")
+grid_search.fit(X_train, y_train)
 
-correct = (y_pred_full == y_primary) | (y_pred_full == y_secondary)
-combined_accuracy = correct.sum() / len(correct)
-print(f"\nAccuracy (Correct if Prediction Matches Either Type): {combined_accuracy:.4f}")
+print("\nBest Parameters:", grid_search.best_params_)
+print(f"Best CV Score (primary label): {grid_search.best_score_:.4f}")
 
-# ---- Plot Accuracy vs k with PCA + SMOTE ----
-print("\n--- Accuracy vs k (matches either type) ---")
-ks = []
-accuracies = []
+# Get the best pipeline
+best_model = grid_search.best_estimator_
 
-for k_try in range(1, 16):
-    knn_try = KNeighborsClassifier(n_neighbors=k_try)
-    knn_try.fit(X_train_pca, y_train_resampled)
-    y_pred_try = knn_try.predict(X_full_pca)
-    correct_try = (y_pred_try == y_primary) | (y_pred_try == y_secondary)
-    acc = correct_try.sum() / len(correct_try)
-    ks.append(k_try)
-    accuracies.append(acc)
-    print(f"k={k_try:2d} -> Accuracy: {acc:.4f}")
+##############################################################################
+# 3. EVALUATE ON TEST SET (PRIMARY OR SECONDARY)
+##############################################################################
 
-# Optional: Plot the results
-plt.plot(ks, accuracies, marker='o')
-plt.title("KNN Accuracy vs k (with PCA + SMOTE)")
-plt.xlabel("Number of Neighbors (k)")
-plt.ylabel("Accuracy (Correct if Matches Either Type)")
-plt.grid(True)
-plt.show()
+# Predict using the best model
+y_pred = best_model.predict(X_test)
+
+# Evaluate: match with primary only
+acc_primary = accuracy_score(y_test, y_pred)
+print(f"\nTest Accuracy (Primary Only): {acc_primary:.4f}")
+
+# Evaluate: match with primary OR secondary
+correct_either = sum(
+    (y_pred[i] == y_test[i]) or (y_pred[i] == sec_test[i])
+    for i in range(len(y_pred))
+)
+acc_either = correct_either / len(y_pred)
+print(f"Test Accuracy (Primary OR Secondary): {acc_either:.4f}")
+
+##############################################################################
+# 4. PER-TYPE ANALYSIS (OPTIONAL)
+##############################################################################
+
+results_df = pd.DataFrame({
+    'predicted': y_pred,
+    'primary': y_test,
+    'secondary': sec_test
+})
+
+print("\nPer-primary-type accuracy (primary OR secondary match):")
+for ptype, group in results_df.groupby('primary'):
+    total = len(group)
+    correct = sum(
+        (row['predicted'] == row['primary']) or (row['predicted'] == row['secondary'])
+        for _, row in group.iterrows()
+    )
+    print(f"  Type {ptype}: {correct}/{total} correct → {correct/total:.4f}")
+
+##############################################################################
+# 5. PCA COMPONENT ANALYSIS (OPTIONAL)
+##############################################################################
+
+pca_model = best_model.named_steps['pca']
+if hasattr(pca_model, 'components_'):
+    print(f"\nNumber of PCA Components Used: {pca_model.n_components_}")
+
+    feature_names = X.columns
+    components_df = pd.DataFrame(
+        np.abs(pca_model.components_),
+        columns=feature_names
+    )
+
+    for i in range(min(5, pca_model.n_components_)):
+        top_features = components_df.iloc[i].sort_values(ascending=False).head(3)
+        print(f"PC{i+1} Top Features: " +
+              ", ".join([f"{feat} ({val:.3f})" for feat, val in top_features.items()]))
